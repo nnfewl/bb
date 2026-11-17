@@ -28,6 +28,15 @@ Prerequisites: [cargo](https://www.rust-lang.org/tools/install) >= 1.36, Linux
 cargo install bb
 ```
 
+Prebuilt, statically linked Linux binaries for x86-64 and ARM64 are available
+on the [GitHub Releases page](https://github.com/nnfewl/bb/releases/latest). Download the archive for your
+architecture and verify it with `sha256sum -c <archive>.sha256` before
+extracting it. The binaries use musl and do not require system shared libraries.
+
+The GitHub Actions workflow builds and tests both architectures on pushes and
+pull requests. A push of a tag beginning with `v` publishes the archives and
+checksums as a GitHub release after both builds succeed.
+
 ## BUILD
      Prerequisites: rustc, cargo >= 1.36, Linux
 
