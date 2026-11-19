@@ -1865,11 +1865,10 @@ fn get(data: &mut ProcessData, follow_pid: Option<Pid>, sort: Sort) -> Vec<Proce
     let ProcessData {
         ref mut parents,
         ref mut processes_index,
-        ref mut tree_index,
-        ref mut tree,
         ref mut processes_times,
         ref mut threads_times,
         cpu_stat: ref mut data_cpu_stat,
+        ..
     } = data;
 
     let mut processes = Vec::with_capacity(2048);
@@ -1968,64 +1967,95 @@ fn get(data: &mut ProcessData, follow_pid: Option<Pid>, sort: Sort) -> Vec<Proce
         }
     }
     *data_cpu_stat = cpu_stat;
-    let mut keep_list = HashSet::new();
-    if follow_pid.is_some() && processes_index.contains_key(follow_pid.as_ref().unwrap()) {
-        let mut stack = Vec::with_capacity(32);
-        let p = &processes[processes_index[&follow_pid.unwrap()]];
-        keep_list.insert(p.i);
-        if let Some(children) = parents.get(&p.i) {
-            stack.extend(children.iter().cloned());
-        }
+    update_process_tree(data, &mut processes, follow_pid, sort);
+    processes
+}
+
+fn update_process_tree(
+    data: &mut ProcessData,
+    processes: &mut Vec<ProcessDisplay>,
+    follow_pid: Option<Pid>,
+    sort: Sort,
+) {
+    let ProcessData {
+        parents,
+        processes_index,
+        tree_index,
+        tree,
+        ..
+    } = data;
+
+    if let Some(&index) = follow_pid.and_then(|pid| processes_index.get(&pid)) {
+        let mut keep_list = HashSet::new();
+        let mut stack = vec![processes[index].i];
         while let Some(pid) = stack.pop() {
-            keep_list.insert(pid);
+            if !keep_list.insert(pid) {
+                continue;
+            }
             if let Some(children) = parents.get(&pid) {
                 stack.extend(children.iter().cloned());
             }
         }
-        stack.push(p.p);
-        while let Some(pid) = stack.pop() {
-            if pid == 0 {
-                continue;
+        let mut parent = processes[index].p;
+        while let Some(&parent_index) = processes_index.get(&parent) {
+            if !keep_list.insert(parent) {
+                break;
             }
-            keep_list.insert(pid);
-            if processes[processes_index[&pid]].p != 0 {
-                stack.push(processes[processes_index[&pid]].p);
-            }
+            parent = processes[parent_index].p;
         }
-        processes_index.clear();
         processes.retain(|entry| keep_list.contains(&entry.i));
-        for (i, p) in processes.iter().enumerate() {
-            processes_index.insert(p.i, i);
-        }
     }
 
+    processes_index.clear();
+    parents.clear();
+    tree.clear();
+    tree_index.clear();
+    for (index, process) in processes.iter().enumerate() {
+        processes_index.insert(process.i, index);
+        parents.entry(process.p).or_default().push(process.i);
+    }
+
+    let compare = |a: &Pid, b: &Pid| {
+        let a = &processes[processes_index[a]];
+        let b = &processes[processes_index[b]];
+        match sort {
+            Sort::CpuAsc => a.cpu_percent.cmp(&b.cpu_percent),
+            Sort::CpuDesc => b.cpu_percent.cmp(&a.cpu_percent),
+            Sort::VmRssAsc => a.vm_rss_value.cmp(&b.vm_rss_value),
+            Sort::VmRssDesc => b.vm_rss_value.cmp(&a.vm_rss_value),
+            Sort::UserAsc => a.username.0.cmp(&b.username.0),
+            Sort::UserDesc => b.username.0.cmp(&a.username.0),
+            Sort::CmdLineAsc => a.cmd_line.0.cmp(&b.cmd_line.0),
+            Sort::CmdLineDesc => b.cmd_line.0.cmp(&a.cmd_line.0),
+        }
+    };
+    for children in parents.values_mut() {
+        children.sort_unstable_by(&compare);
+    }
+    let mut roots: Vec<Pid> = processes
+        .iter()
+        .filter(|p| !processes_index.contains_key(&p.p))
+        .map(|p| p.i)
+        .collect();
+    roots.sort_unstable_by(&compare);
+
+    // A process snapshot can be incomplete. Start a new tree at each visible
+    // process whose parent is missing; visit any remaining cycles only once.
+    let mut visited = HashSet::new();
     let mut stack = Vec::with_capacity(processes.len());
-    stack.push((0, 1));
-    while let Some((ind, pid)) = stack.pop() {
-        tree_index.insert(pid, tree.len());
-        tree.push((ind, pid));
-        if let Some(children) = parents.get_mut(&pid) {
-            if follow_pid.is_some() {
-                children.retain(|c| keep_list.contains(c));
+    for root in roots.into_iter().chain(processes.iter().map(|p| p.i)) {
+        stack.push((0, root));
+        while let Some((ind, pid)) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
             }
-            children.sort_unstable_by(|a, b| {
-                let a = &processes[processes_index[a]];
-                let b = &processes[processes_index[b]];
-                match sort {
-                    Sort::CpuAsc => a.cpu_percent.cmp(&b.cpu_percent),
-                    Sort::CpuDesc => b.cpu_percent.cmp(&a.cpu_percent),
-                    Sort::VmRssAsc => a.vm_rss_value.cmp(&b.vm_rss_value),
-                    Sort::VmRssDesc => b.vm_rss_value.cmp(&a.vm_rss_value),
-                    Sort::UserAsc => a.username.0.cmp(&b.username.0),
-                    Sort::UserDesc => b.username.0.cmp(&a.username.0),
-                    Sort::CmdLineAsc => a.cmd_line.0.cmp(&b.cmd_line.0),
-                    Sort::CmdLineDesc => b.cmd_line.0.cmp(&a.cmd_line.0),
-                }
-            });
-            stack.extend(children.iter().map(|p| (ind + 1, *p)).rev());
+            tree_index.insert(pid, tree.len());
+            tree.push((ind, pid));
+            if let Some(children) = parents.get(&pid) {
+                stack.extend(children.iter().map(|p| (ind + 1, *p)).rev());
+            }
         }
     }
-    processes
 }
 
 /// Returns error if process has disappeared during the function's run
@@ -2140,4 +2170,89 @@ fn get_pid_info(mut path: PathBuf, thread: bool) -> Result<Process, std::io::Err
         ret.rtime += err!(usize::from_str(none_err!(vals.next())));
     }
     Ok(ret)
+}
+
+#[cfg(test)]
+mod process_tree_tests {
+    use super::*;
+
+    fn process(pid: Pid, parent: Pid) -> ProcessDisplay {
+        ProcessDisplay {
+            i: pid,
+            p: parent,
+            pid: PidString(pid.to_string()),
+            ppid: PpidString(parent.to_string()),
+            vm_rss: VmRssString(String::new()),
+            vm_rss_value: 0,
+            cpu_percent: 0,
+            state: State::Running,
+            cmd_line: CmdLineString(format!("process-{pid:03}")),
+            username: UserString(String::new()),
+            rtime: 0,
+            is_thread: false,
+        }
+    }
+
+    fn prepare(list: &mut ProcessList, entries: &[(Pid, Pid)], follow: Option<Pid>) {
+        list.processes = entries
+            .iter()
+            .map(|&(pid, ppid)| process(pid, ppid))
+            .collect();
+        list.data.parents.clear();
+        list.data.processes_index.clear();
+        for (index, p) in list.processes.iter().enumerate() {
+            list.data.processes_index.insert(p.i, index);
+            list.data.parents.entry(p.p).or_default().push(p.i);
+        }
+        update_process_tree(
+            &mut list.data,
+            &mut list.processes,
+            follow,
+            Sort::CmdLineAsc,
+        );
+    }
+
+    #[test]
+    fn hidden_parents_form_a_forest_that_can_be_drawn() {
+        let mut list = ProcessList::new();
+        prepare(&mut list, &[(10, 1), (11, 10), (20, 99), (21, 20)], None);
+        assert_eq!(list.data.tree, vec![(0, 10), (1, 11), (0, 20), (1, 21)]);
+        assert!(!list.data.processes_index.contains_key(&1));
+        let mut grid = CellBuffer::new(120, 40, Cell::default());
+        let area = grid.area();
+        list.draw_tree_list(&mut grid, area, true, 0, 38);
+    }
+
+    #[test]
+    fn follow_keeps_visible_ancestors_and_descendants_when_parent_is_hidden() {
+        let mut list = ProcessList::new();
+        prepare(
+            &mut list,
+            &[(10, 1), (11, 10), (12, 11), (13, 10), (20, 99)],
+            Some(11),
+        );
+        assert_eq!(list.data.tree, vec![(0, 10), (1, 11), (2, 12)]);
+        assert_eq!(
+            list.processes.iter().map(|p| p.i).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn complete_tree_and_missing_follow_target_keep_all_processes() {
+        let mut list = ProcessList::new();
+        let entries = [(1, 0), (3, 1), (2, 1), (4, 2)];
+        prepare(&mut list, &entries, None);
+        let expected = vec![(0, 1), (1, 2), (2, 4), (1, 3)];
+        assert_eq!(list.data.tree, expected);
+        prepare(&mut list, &entries, Some(999));
+        assert_eq!(list.data.tree, expected);
+    }
+
+    #[test]
+    fn cyclic_snapshot_is_finite_and_includes_each_process() {
+        let mut list = ProcessList::new();
+        prepare(&mut list, &[(10, 11), (11, 10), (12, 11)], Some(10));
+        assert_eq!(list.data.tree, vec![(0, 10), (1, 11), (2, 12)]);
+    }
 }
